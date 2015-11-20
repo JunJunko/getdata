@@ -1,0 +1,9 @@
+CREATE TABLE hue.getdata (
+  `data_dt` char(10) DEFAULT NULL,
+  `code` char(10) DEFAULT NULL,
+  `nam` varchar(30) DEFAULT NULL,
+  `spj` decimal(10,2) DEFAULT NULL,
+  `hight` decimal(10,2) DEFAULT NULL,
+  `low` decimal(10,2) DEFAULT NULL,
+  `kpj` decimal(10,2) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
