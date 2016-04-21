@@ -1,0 +1,671 @@
+CREATE OR REPLACE PROCEDURE SP_LOAD_EDW(P_STG_LIBRY       VARCHAR2,
+                                        P_TGT_LIBRY       VARCHAR2,
+                                        P_SK_TBL_NM       VARCHAR2,
+                                        P_PRE_TAB_NM      VARCHAR2,
+                                        P_TGT_TAB_NM      VARCHAR2,
+                                        P_LOAD_TYPE       VARCHAR2,
+                                        P_BATCH_NUM       VARCHAR2) AUTHID CURRENT_USER AS
+---------------------------------------------------------------------------------------------------------------------------
+-- File Name    : SP_LOAD_EDW
+-- Author       : Sarvar Xie
+-- Version      : 1.0.12
+-- Date         : 2016.04.20
+-- Copyright    : AIAIT
+-- Description  : REMOVE DUPLICATE DATA BEFORE LOAD INTO EDW
+-- Usage        : $$STG_LIBRY.SP_LOAD_EDW($$STG_LIBRY,$$TGT_LIBRY,$$SK_TBL_NM,$$PRE_TAB_NM,$$TGT_TAB_NM,$$p_BATCH_TYPE,$$BATCH_ID)
+--                e.g. ADAM_STG.SP_LOAD_EDW('ADAM_STG','ADAM_EDW','SK_EDW_CLAIM_DIM','S_CLAIM_DIM','CLAIM_DIM','INC','201604120100');
+-- Function List: N/A
+-- Comments     : Compare HASH_NBR
+-- History      :
+--   1. Date        : 2016_04_12
+--      Author      : Sarvar Xie
+--      Modification: Add exception COL_NUM_INCORRECT
+--   2. Date        : 2016_04_13
+--      Author      : Sarvar Xie
+--      Modification: Add RAISE_APPLICATION_ERROR
+--   3. Date        : 2016_04_14
+--      Author      : Sarvar Xie
+--      Modification: 1) UPDATE SK TABLE RECORD_EFF_TO_DT TO 1899-01-01 WHERE ACTIVE_FLAG = 'N'
+--                    2) CHANGE (UPDATE PRE TABLE HASH_NBR FROM SK TABLE) TO (UPDATE SK TABLE HASH_NBR FROM PRE TABLE) - STEP 2.2 --> STEP 6
+--   4. Date        : 2016_04_15
+--      Author      : Sarvar Xie
+--      Modification: WHEN ACTIVE_FLAG = 'N' THEN KEEP SK TABLE OLD.RECORD_EFF_FROM_DT
+--   5. Date        : 2016_04_18
+--      Author      : Sarvar Xie
+--      Modification: 1) Change pre_table active_flag default to 'N'
+--                    2) If active_flag = 'Y' then modify record_eff_dt to min(reocrd_eff_dt) over(partition by bk,hash_nbr,group_flag) 
+--                       else keep reocrd_eff_dt as before
+--                    3) keep reocrd_eff_to_dt as before in pre table
+--                    4) Delete data in sk_table where sk.sk in (select pk from pre_table where active_flag='N'
+--   6. Date        : 2016_04_19
+--      Author      : Sarvar Xie
+--      Modification: Fix bug: delete data from sk table where active_flag = 'N'
+--   7. Date        : 2016_04_20
+--      Author      : Sarvar Xie
+--      Modification: 1) Update hash_nbr in pre_table include the record where active_flag = 'N'
+--                    2) Add parameter P_BATCH_START_TS
+--                       sk_table: if record_eff_from_dt < P_BATCH_START_TS (the record inserted in pre batch)
+--                                 then keep record not to delete
+---------------------------------------------------------------------------------------------------------------------------
+
+/*--------------- QUERY SP RUN LOG ---------------
+SELECT LOG_TMSP,
+       ETL_PROCESS_LOG_ID,
+       BATCH_NUM,
+       SRC_SYS,
+       LOG_TYPE,
+       LOG_TEXT,
+       TO_CHAR(SUBSTR(SQL_STMT, 1, 4000)) FULL_SQL_STMT
+  FROM ETL_PROCESS_LOG
+ ORDER BY LOG_TMSP DESC;
+
+--------------- QUERY SP ERR LOG ---------------
+SELECT ETL_PROCESS_RUN_ID,
+       ENTITY_PROCESS_ID,
+       SRC_SYS,
+       ERROR_TMSP,
+       ERROR_TEXT
+  FROM ETL_PROCESS_ERROR
+ ORDER BY ERROR_TMSP DESC;
+------------------------------------------------- */
+
+  V_SQL                                              VARCHAR2(32767);
+  TAB_NOT_EXISTS                                     EXCEPTION;
+  PK_NOT_DEFINED                                     EXCEPTION;
+  COL_NUM_INCORRECT                                  EXCEPTION;
+  V_EXCEPTION_TXT                                    VARCHAR2(200);
+  V_LOG                                              ETL_PROCESS_LOG%ROWTYPE;
+  V_ERR                                              ETL_PROCESS_ERROR%ROWTYPE;
+  V_COL_NUM_DIFF                                     INTEGER := 3;    -- PRE_TABLE_COL_NUM = EDW_TABLE_COL_NUM + 3
+  V_BATCH_START_TS                                   TIMESTAMP;
+  TYPE REC IS RECORD(
+    TAB_TYP                                          VARCHAR2(10),
+    OWNER                                            VARCHAR2(30),
+    TBL_NM                                           VARCHAR2(30),
+    PK_COL                                           VARCHAR2(30),
+    COL_CNT                                          INTEGER,
+    COL_LIST                                         VARCHAR2(4000),
+    EXCEPT_PK_COL_LIST                               VARCHAR2(4000),
+    HASH_COL_TXT                                     VARCHAR2(4000)
+    --PARTITION_NAME                                   VARCHAR2(30) ----------<<<< ADD PARTITION TABLE ?
+    );
+
+  T_SK  REC;
+  T_PRE REC;
+  T_EDW REC;
+
+BEGIN
+
+
+  DECLARE
+    CURSOR TAB_INFO IS
+      SELECT T.OWNER,
+             T.TABLE_NAME,
+             T.TAB_TYP,
+             CON_COLS.COLUMN_NAME PK_COL,
+             COUNT(POSITION) COL_CNT,
+             LISTAGG(C.COLUMN_NAME, ',') WITHIN GROUP(ORDER BY COLUMN_ID) COL_LIST,
+             LISTAGG(DECODE(C.COLUMN_NAME,
+                            CON_COLS.COLUMN_NAME,
+                            NULL,
+                            C.COLUMN_NAME),
+                     ',') WITHIN GROUP(ORDER BY COLUMN_ID) EXCEPT_PK_COL_LIST,
+             LISTAGG(DECODE(C.COLUMN_NAME,
+                            CON_COLS.COLUMN_NAME,
+                            NULL,
+                            'BUSINESS_KEY',
+                            NULL,
+                            'ACTIVE_FLAG',
+                            NULL,
+                            'HASH_NBR',
+                            NULL,
+                            'RECORD_EFF_DT',
+                            NULL,
+                            'RECORD_EFF_FROM_DT',
+                            NULL,
+                            'RECORD_EFF_TO_DT',
+                            NULL,
+
+                            'NVL(' || DECODE(C.DATA_TYPE,
+                                             'DATE',
+                                             'TO_CHAR(',
+                                             'TIMESTAMP(6)',
+                                             'TO_CHAR(',
+                                             NULL) || C.COLUMN_NAME ||
+                            DECODE(C.DATA_TYPE,
+                                   'DATE',
+                                   ',''YYYYMMDD''),''*''',
+                                   'TIMESTAMP(6)',
+                                   ',''YYYYMMDDHH24MISSFF6''),''*''',
+                                   'NUMBER',
+                                   ',-1',
+                                   'INTEGER',
+                                   ',-1',
+                                   'DECIMAL',
+                                   ',-1',
+                                   'VARCHAR2',
+                                   ',''*''',
+                                   'CHAR',
+                                   ',''*''',
+                                   NULL) || ')'
+
+                            ),
+                     ' || ') WITHIN GROUP(ORDER BY COLUMN_ID) HASH_COL_TXT
+
+        FROM (SELECT 'SK' TAB_TYP, P_STG_LIBRY OWNER, P_SK_TBL_NM TABLE_NAME
+                FROM DUAL
+              UNION
+              SELECT 'PRE' TAB_TYP,
+                     P_TGT_LIBRY OWNER,
+                     P_PRE_TAB_NM TABLE_NAME
+                FROM DUAL
+              UNION
+              SELECT 'EDW' TAB_TYP,
+                     P_TGT_LIBRY OWNER,
+                     P_TGT_TAB_NM TABLE_NAME
+                FROM DUAL) T
+        LEFT JOIN ALL_TAB_COLS C
+          ON T.OWNER = C.OWNER
+         AND T.TABLE_NAME = C.TABLE_NAME
+        LEFT JOIN ALL_CONSTRAINTS CONS
+          ON T.OWNER = CONS.OWNER
+         AND T.TABLE_NAME = CONS.TABLE_NAME
+         AND CONS.CONSTRAINT_TYPE = 'P'
+        LEFT JOIN ALL_CONS_COLUMNS CON_COLS
+          ON CON_COLS.OWNER = CONS.OWNER
+         AND CON_COLS.TABLE_NAME = CONS.TABLE_NAME
+         AND CON_COLS.CONSTRAINT_NAME = CONS.CONSTRAINT_NAME
+       GROUP BY T.OWNER, T.TABLE_NAME, T.TAB_TYP, CON_COLS.COLUMN_NAME;
+
+  BEGIN
+
+    DBMS_OUTPUT.PUT_LINE('----BEGIN! ' || TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS') || CHR(10));
+
+    V_LOG.LOG_TYPE               := 'INFORMATION';
+    V_LOG.RECORD_AFFECTED        := 0;
+    V_LOG.SRC_SYS                := SUBSTR(P_TGT_TAB_NM,1,10);  -- SRC_SYC VARCHAR2(10)
+    V_LOG.BATCH_NUM              := P_BATCH_NUM;
+
+    V_ERR.SRC_SYS                := P_TGT_TAB_NM;
+
+
+    --V_LOG_LEVEL:='HIGH';
+
+    EXECUTE IMMEDIATE 'ALTER SESSION SET HASH_AREA_SIZE=2000000000';
+    EXECUTE IMMEDIATE 'ALTER SESSION ENABLE PARALLEL DML';
+    V_SQL := 'SELECT T.OWNER,
+             T.TABLE_NAME,
+             T.TAB_TYP,
+             CON_COLS.COLUMN_NAME PK_COL,
+             COUNT(POSITION) COL_CNT,
+             LISTAGG(C.COLUMN_NAME, '','') WITHIN GROUP(ORDER BY COLUMN_ID) COL_LIST,
+             LISTAGG(DECODE(C.COLUMN_NAME,
+                            CON_COLS.COLUMN_NAME,
+                            NULL,
+                            C.COLUMN_NAME),
+                     '','') WITHIN GROUP(ORDER BY COLUMN_ID) EXCEPT_PK_COL_LIST,
+             LISTAGG(DECODE(C.COLUMN_NAME,
+                            CON_COLS.COLUMN_NAME,
+                            NULL,
+                            ''BUSINESS_KEY'',
+                            NULL,
+                            ''ACTIVE_FLAG'',
+                            NULL,
+                            ''HASH_NBR'',
+                            NULL,
+                            ''RECORD_EFF_DT'',
+                            NULL,
+                            ''RECORD_EFF_FROM_DT'',
+                            NULL,
+                            ''RECORD_EFF_TO_DT'',
+                            NULL,
+
+                            ''NVL('' || DECODE(C.DATA_TYPE,
+                                             ''DATE'',
+                                             ''TO_CHAR('',
+                                             ''TIMESTAMP(6)'',
+                                             ''TO_CHAR('',
+                                             NULL) || C.COLUMN_NAME ||
+                            DECODE(C.DATA_TYPE,
+                                   ''DATE'',
+                                   '',''''YYYYMMDD''''),''''*'''''',
+                                   ''TIMESTAMP(6)'',
+                                   '',''''YYYYMMDDHH24MISSFF6''''),''''*'''''',
+                                   ''NUMBER'',
+                                   '',-1'',
+                                   ''INTEGER'',
+                                   '',-1'',
+                                   ''DECIMAL'',
+                                   '',-1'',
+                                   ''VARCHAR2'',
+                                   '',''''*'''''',
+                                   ''CHAR'',
+                                   '',''''*'''''',
+                                   NULL) || '')''
+
+                            ),
+                     '' || '') WITHIN GROUP(ORDER BY COLUMN_ID) HASH_COL_TXT
+
+        FROM (SELECT ''SK'' TAB_TYP,'''|| P_STG_LIBRY ||''' OWNER,'''||P_SK_TBL_NM ||''' TABLE_NAME
+                FROM DUAL
+              UNION
+              SELECT ''PRE'' TAB_TYP,'''||
+                     P_TGT_LIBRY ||''' OWNER,'''||
+                     P_PRE_TAB_NM ||''' TABLE_NAME
+                FROM DUAL
+              UNION
+              SELECT ''EDW'' TAB_TYP,'''||
+                     P_TGT_LIBRY ||''' OWNER,'''||
+                     P_TGT_TAB_NM ||''' TABLE_NAME
+                FROM DUAL) T
+        LEFT JOIN ALL_TAB_COLS C
+          ON T.OWNER = C.OWNER
+         AND T.TABLE_NAME = C.TABLE_NAME
+        LEFT JOIN ALL_CONSTRAINTS CONS
+          ON T.OWNER = CONS.OWNER
+         AND T.TABLE_NAME = CONS.TABLE_NAME
+         AND CONS.CONSTRAINT_TYPE = ''P''
+        LEFT JOIN ALL_CONS_COLUMNS CON_COLS
+          ON CON_COLS.OWNER = CONS.OWNER
+         AND CON_COLS.TABLE_NAME = CONS.TABLE_NAME
+         AND CON_COLS.CONSTRAINT_NAME = CONS.CONSTRAINT_NAME
+       GROUP BY T.OWNER, T.TABLE_NAME, T.TAB_TYP, CON_COLS.COLUMN_NAME';
+
+    DBMS_OUTPUT.PUT_LINE('----QUERY TABLE PK COL AND COL LIST' || CHR(10) || CHR(10)|| V_SQL || CHR(10));
+
+    T_SK.OWNER   := P_STG_LIBRY;
+    T_PRE.OWNER  := P_TGT_LIBRY;
+    T_EDW.OWNER  := P_TGT_LIBRY;
+    T_SK.TBL_NM  := P_SK_TBL_NM;
+    T_PRE.TBL_NM := P_PRE_TAB_NM;
+    T_EDW.TBL_NM := P_TGT_TAB_NM;
+
+    -- 1. GET PK COLUMN AND COLUMN LIST (IF TABLE NOT EXISTS THEN EXIT)
+    V_SQL := 'select SEQ_ETL_PROCESS_RUN_ID.nextval from dual';
+    execute immediate V_SQL into V_LOG.ETL_PROCESS_LOG_ID;
+    V_LOG.ETL_PROCESS_RUN_ID       := 1;
+    V_LOG.ENTITY_PROCESS_ID        := 1;
+    V_LOG.LOG_TMSP                 := SYSDATE;
+
+    FOR REC_TAB_INFO IN TAB_INFO LOOP
+      /*DBMS_OUTPUT.PUT_LINE(REC_TAB_INFO.OWNER || ' ' ||
+                           REC_TAB_INFO.TABLE_NAME || ' ' ||
+                           REC_TAB_INFO.PK_COL || ' ' ||
+                           REC_TAB_INFO.COL_LIST);*/
+
+      V_LOG.LOG_TEXT                 := 'SP_LOAD_EDW: 1 - GET '|| REC_TAB_INFO.OWNER || '.' || REC_TAB_INFO.TABLE_NAME || ' PK COLUMN AND COLUMN LIST';
+
+      IF REC_TAB_INFO.COL_LIST IS NULL THEN
+        V_EXCEPTION_TXT := 'ERROR: ' || REC_TAB_INFO.OWNER || '.' ||
+                           REC_TAB_INFO.TABLE_NAME || ' NOT EXISTS!';
+        RAISE TAB_NOT_EXISTS;
+
+      ELSIF REC_TAB_INFO.PK_COL IS NULL THEN
+        V_EXCEPTION_TXT := 'ERROR: ' || REC_TAB_INFO.OWNER || '.' ||
+                           REC_TAB_INFO.TABLE_NAME || ' PK COLUMN NOT DEFINED!';
+        RAISE PK_NOT_DEFINED;
+
+      END IF;
+
+      DBMS_OUTPUT.PUT_LINE('----' || V_LOG.LOG_TEXT || chr(10) || chr(10) || V_SQL || chr(10) );
+
+      IF REC_TAB_INFO.TAB_TYP = 'SK' THEN
+        T_SK.PK_COL := REC_TAB_INFO.PK_COL;
+      ELSIF REC_TAB_INFO.TAB_TYP = 'PRE' THEN
+        T_PRE.PK_COL             := REC_TAB_INFO.PK_COL;
+        T_PRE.COL_CNT            := REC_TAB_INFO.COL_CNT;
+        T_PRE.COL_LIST           := REC_TAB_INFO.COL_LIST;
+        T_PRE.EXCEPT_PK_COL_LIST := REC_TAB_INFO.EXCEPT_PK_COL_LIST;
+        T_PRE.HASH_COL_TXT       := REC_TAB_INFO.HASH_COL_TXT;
+      ELSE
+        T_EDW.PK_COL             := REC_TAB_INFO.PK_COL;
+        T_EDW.COL_CNT            := REC_TAB_INFO.COL_CNT;
+        T_EDW.COL_LIST           := REC_TAB_INFO.COL_LIST;
+        T_EDW.EXCEPT_PK_COL_LIST := REC_TAB_INFO.EXCEPT_PK_COL_LIST;
+        T_EDW.HASH_COL_TXT       := REC_TAB_INFO.HASH_COL_TXT;
+
+
+      END IF;
+
+    IF T_PRE.COL_CNT <> T_EDW.COL_CNT + V_COL_NUM_DIFF THEN
+      V_EXCEPTION_TXT := T_PRE.OWNER || '.' || T_PRE.TBL_NM || '''s COL_CNT (' || T_PRE.COL_CNT 
+                         || ') <> ' || T_EDW.OWNER || '.' || T_EDW.TBL_NM || '''s COL_CNT (' || T_EDW.COL_CNT || ') + ' || to_char(V_COL_NUM_DIFF);
+      RAISE COL_NUM_INCORRECT;
+    END IF;
+
+    INSERT INTO ETL_PROCESS_LOG VALUES V_LOG;
+    COMMIT;
+    END LOOP;
+
+
+    -- 2 UPDATE HASH NUMBER TO SK TABLE
+    IF P_LOAD_TYPE = 'HIST' THEN
+
+      /*-- 2.1 INITIAL LOAD
+      V_SQL := 'MERGE INTO ' || T_SK.OWNER || '.' || T_SK.TBL_NM || ' SK' ||
+               CHR(10) || 'USING
+      (
+      SELECT ' || T_EDW.PK_COL ||
+               ',RECORD_EFF_DT,DBMS_CRYPTO.HASH(TO_CLOB(NVL((' ||
+               T_EDW.HASH_COL_TXT || '),''*'')),3) HASH_NBR' || ' FROM ' ||
+               T_EDW.OWNER || '.' || T_EDW.TBL_NM || '
+      ) EDW ON(EDW.' || T_EDW.PK_COL ||
+               '=SK.SK)
+      WHEN MATCHED THEN
+      UPDATE
+      SET Sk.HASH_NBR = EDW.HASH_NBR';
+      DBMS_OUTPUT.PUT_LINE('----' || V_LOG.LOG_TEXT || chr(10) || chr(10) || V_SQL || chr(10) );
+      --WRITE LOG
+
+      EXECUTE IMMEDIATE (V_SQL);
+      COMMIT;
+
+      INSERT INTO ETL_PROCESS_LOG VALUES V_LOG;
+      COMMIT;*/
+
+      RETURN;
+
+    ELSE
+
+      -- 3 UPDATE BUSINESS_KEY / HASH_NBR / ACTIVE_FLAG TO PRE TABLE
+
+      V_SQL := 'select SEQ_ETL_PROCESS_RUN_ID.nextval from dual';
+      execute immediate V_SQL into V_LOG.ETL_PROCESS_LOG_ID;
+      V_LOG.ETL_PROCESS_RUN_ID       := 3;
+      V_LOG.ENTITY_PROCESS_ID        := 1;
+      V_LOG.LOG_TMSP                 := SYSDATE;
+      V_LOG.LOG_TEXT                 := 'SP_LOAD_EDW: 3 - MERGE BUSINESS_KEY/HASH_NBR/ACTIVE_FLAG INTO PRE TABLE';
+
+      V_SQL := 'MERGE INTO ' || T_PRE.OWNER || '.' || T_PRE.TBL_NM ||
+               ' PRE
+            USING (SELECT SK,BUSINESS_KEY/*,RECORD_EFF_FROM_DT*/,HASH_NBR ' || CHR(10) ||
+                  '        FROM ' ||
+               T_SK.OWNER || '.' || T_SK.TBL_NM ||
+               ') SK
+           ON(SK.SK =PRE.' || T_PRE.PK_COL ||
+              --'AND PRE.RECORD_EFF_DT IS NULL)
+               ')
+            WHEN MATCHED THEN
+            UPDATE
+            SET PRE.BUSINESS_KEY = SK.BUSINESS_KEY,
+              --PRE.RECORD_EFF_FROM_DT = SK.RECORD_EFF_FROM_DT,
+              PRE.HASH_NBR = SK.HASH_NBR,
+              PRE.ACTIVE_FLAG  = ''N''';
+
+      V_LOG.SQL_STMT := TO_CLOB(V_SQL);
+
+      DBMS_OUTPUT.PUT_LINE('----' || V_LOG.LOG_TEXT || chr(10) || chr(10) || V_SQL || chr(10) );
+      EXECUTE IMMEDIATE (V_SQL);
+
+      COMMIT;
+
+      INSERT INTO ETL_PROCESS_LOG VALUES V_LOG;
+      COMMIT;
+
+      -- 4 UPDATE RECORD_EFF_TO_DT AND ACTIVE FLAG TO PRE TABLE
+
+      V_SQL := 'select SEQ_ETL_PROCESS_RUN_ID.nextval from dual';
+      execute immediate V_SQL into V_LOG.ETL_PROCESS_LOG_ID;
+      V_LOG.ETL_PROCESS_RUN_ID       := 4;
+      V_LOG.ENTITY_PROCESS_ID        := 1;
+      V_LOG.LOG_TMSP                 := SYSDATE;
+      V_LOG.LOG_TEXT                 := 'SP_LOAD_EDW: 4 - PRE TABLE: FILTER DUPLICATION';
+
+      /*V_SQL := 'MERGE INTO ' || T_PRE.OWNER || '.' || T_PRE.TBL_NM ||
+               ' PRE ' || CHR(10) || 'USING (SELECT ' || T_PRE.PK_COL || ',
+                     RECORD_EFF_TO_DT,
+                     ACTIVE_FLAG
+                FROM(SELECT ' || T_PRE.PK_COL || ',
+                           RECORD_EFF_TO_DT_N RECORD_EFF_TO_DT,
+                           ACTIVE_FLAG
+                      FROM (SELECT ' || T_PRE.PK_COL || ',
+                                   RECORD_EFF_TO_DT,
+                                   MAX(RECORD_EFF_TO_DT) OVER(PARTITION BY BUSINESS_KEY, GROUP_ID) RECORD_EFF_TO_DT_N,
+                                   ACTIVE_FLAG,
+                                   CASE
+                                     WHEN (ACTIVE_FLAG = ''N'' OR
+                                          RECORD_EFF_TO_DT <> MAX(RECORD_EFF_TO_DT)
+                                           OVER(PARTITION BY BUSINESS_KEY, GROUP_ID)) THEN
+                                      1
+                                     ELSE
+                                      0
+                                   END CHANGE_FLAG
+                              FROM (SELECT ' || T_PRE.PK_COL || ',
+                                           BUSINESS_KEY,
+                                           RECORD_EFF_TO_DT,
+                                           SUM(GROUP_FLAG) OVER(PARTITION BY BUSINESS_KEY ORDER BY RECORD_EFF_DT ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) GROUP_ID,
+                                           DECODE(GROUP_FLAG, 0, ''N'', ''Y'') ACTIVE_FLAG
+                                      FROM (SELECT ' ||
+               T_PRE.PK_COL || ',
+                                                   BUSINESS_KEY,
+                                                   RECORD_EFF_DT,
+                                                   LAG(RECORD_EFF_TO_DT) OVER(PARTITION BY BUSINESS_KEY ORDER BY RECORD_EFF_DT) + 1 / 86400 LAG_TO_DT,
+                                                   RECORD_EFF_TO_DT,
+                                                   HASH_NBR,
+                                                   LAG(HASH_NBR) OVER(PARTITION BY BUSINESS_KEY ORDER BY RECORD_EFF_DT) LAG_HASH_NBR,
+                                                   CASE
+                                                     WHEN LAG(RECORD_EFF_TO_DT + 1 / 86400)
+                                                      OVER(PARTITION BY BUSINESS_KEY ORDER BY
+                                                               RECORD_EFF_DT) < RECORD_EFF_DT THEN
+                                                      1
+                                                     WHEN HASH_NBR = LAG(HASH_NBR)
+                                                      OVER(PARTITION BY BUSINESS_KEY ORDER BY
+                                                               RECORD_EFF_DT) THEN
+                                                      0
+                                                     ELSE
+                                                      1
+                                                   END GROUP_FLAG,
+                                                   ACTIVE_FLAG
+                                              FROM ' ||
+               T_PRE.OWNER || '.' || T_PRE.TBL_NM ||
+               ')))
+                     WHERE CHANGE_FLAG = 1))T
+                  ON(T.' || T_PRE.PK_COL || ' =PRE.' ||
+               T_PRE.PK_COL || ')
+                          WHEN MATCHED THEN
+                          UPDATE
+                          SET PRE.RECORD_EFF_TO_DT = T.RECORD_EFF_TO_DT,
+                              PRE.ACTIVE_FLAG  = T.ACTIVE_FLAG';*/
+
+      V_SQL := 'MERGE INTO ' || T_PRE.OWNER || '.' || T_PRE.TBL_NM ||
+               ' PRE ' || CHR(10) || 'USING (SELECT ' || T_PRE.PK_COL || ',
+                     RECORD_EFF_DT,
+                     --RECORD_EFF_TO_DT,
+                     HASH_NBR,
+                     ACTIVE_FLAG
+                FROM(SELECT ' || T_PRE.PK_COL || ',
+                           DECODE(ACTIVE_FLAG,''N'',RECORD_EFF_DT,RECORD_EFF_DT_N) RECORD_EFF_DT,
+                           --RECORD_EFF_TO_DT,
+                           HASH_NBR,
+                           ACTIVE_FLAG
+                      FROM (SELECT ' || T_PRE.PK_COL || ',
+                                   RECORD_EFF_DT,
+                                   MIN(RECORD_EFF_DT) OVER(PARTITION BY BUSINESS_KEY, GROUP_ID) RECORD_EFF_DT_N,
+                                   --RECORD_EFF_TO_DT,
+                                   HASH_NBR,
+                                   ACTIVE_FLAG/*,
+                                   CASE
+                                     WHEN (ACTIVE_FLAG = ''N'' OR
+                                          RECORD_EFF_TO_DT <> MAX(RECORD_EFF_TO_DT)
+                                           OVER(PARTITION BY BUSINESS_KEY, GROUP_ID)) THEN
+                                      1
+                                     ELSE
+                                      0
+                                   END CHANGE_FLAG*/
+                              FROM (SELECT ' || T_PRE.PK_COL || ',
+                                           BUSINESS_KEY,
+                                           RECORD_EFF_DT,
+                                           RECORD_EFF_TO_DT,
+                                           HASH_NBR,
+                                           SUM(GROUP_FLAG) OVER(PARTITION BY BUSINESS_KEY ORDER BY RECORD_EFF_DT ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) GROUP_ID,
+                                           DECODE(ACTIVE_FLAG, 0, ''N'', ''Y'') ACTIVE_FLAG
+                                      FROM (SELECT ' ||T_PRE.PK_COL || ',
+                                                   BUSINESS_KEY,
+                                                   RECORD_EFF_DT,
+                                                   LAG(RECORD_EFF_TO_DT) OVER(PARTITION BY BUSINESS_KEY ORDER BY RECORD_EFF_DT) + 1 / 86400 LAG_TO_DT,
+                                                   RECORD_EFF_TO_DT,
+                                                   
+                                                   
+                                                   HASH_NBR,
+                                                   LAG(HASH_NBR) OVER(PARTITION BY BUSINESS_KEY ORDER BY RECORD_EFF_DT) LAG_HASH_NBR,
+                                                   CASE
+                                                     WHEN LAG(RECORD_EFF_TO_DT + 1 / 86400)
+                                                      OVER(PARTITION BY BUSINESS_KEY ORDER BY
+                                                               RECORD_EFF_DT) < RECORD_EFF_DT THEN
+                                                      1
+                                                     WHEN HASH_NBR = LAG(HASH_NBR)
+                                                      OVER(PARTITION BY BUSINESS_KEY ORDER BY
+                                                               RECORD_EFF_DT) THEN
+                                                      0
+                                                     ELSE
+                                                      1
+                                                   END GROUP_FLAG,
+                                                   CASE
+                                                     WHEN LAG(RECORD_EFF_TO_DT + 1 / 86400)
+                                                      OVER(PARTITION BY BUSINESS_KEY ORDER BY
+                                                               RECORD_EFF_DT) < RECORD_EFF_DT THEN
+                                                      1
+                                                     WHEN HASH_NBR = LEAD(HASH_NBR)
+                                                      OVER(PARTITION BY BUSINESS_KEY ORDER BY
+                                                               RECORD_EFF_DT) THEN
+                                                      0
+                                                     ELSE
+                                                      1
+                                                   END ACTIVE_FLAG
+                                              FROM (SELECT ' ||T_PRE.PK_COL || ',
+                                                           BUSINESS_KEY,
+                                                           RECORD_EFF_DT,
+                                                           RECORD_EFF_TO_DT,
+                                                           DECODE(HASH_NBR,NULL,DBMS_CRYPTO.HASH(TO_CLOB(NVL((' || T_PRE.HASH_COL_TXT || '),''*'')),3),HASH_NBR) HASH_NBR
+                                                      FROM ' || T_PRE.OWNER || '.' || T_PRE.TBL_NM || '))))
+                     /*WHERE ACTIVE_FLAG = ''Y''CHANGE_FLAG = 1*/))T
+                  ON(T.' || T_PRE.PK_COL || ' =PRE.' || T_PRE.PK_COL || ') 
+                          WHEN MATCHED THEN
+                          UPDATE
+                          SET PRE.RECORD_EFF_DT      = T.RECORD_EFF_DT,
+                              --PRE.RECORD_EFF_TO_DT = T.RECORD_EFF_TO_DT,
+                              PRE.HASH_NBR           = T.HASH_NBR,
+                              PRE.ACTIVE_FLAG        = T.ACTIVE_FLAG';
+
+      V_LOG.SQL_STMT := TO_CLOB(V_SQL);
+
+     -- DBMS_OUTPUT.PUT_LINE('----' || V_LOG.LOG_TEXT || chr(10) || chr(10) || V_SQL || chr(10) );
+
+      EXECUTE IMMEDIATE (V_SQL);
+      COMMIT;
+
+      INSERT INTO ETL_PROCESS_LOG VALUES V_LOG;
+      COMMIT;
+
+      -- 5 MERGE INTO EDW TABLE
+
+      V_SQL := 'select SEQ_ETL_PROCESS_RUN_ID.nextval from dual';
+      execute immediate V_SQL into V_LOG.ETL_PROCESS_LOG_ID;
+      V_LOG.ETL_PROCESS_RUN_ID       := 5;
+      V_LOG.ENTITY_PROCESS_ID        := 1;
+      V_LOG.LOG_TMSP                 := SYSDATE;
+      V_LOG.LOG_TEXT                 := 'SP_LOAD_EDW: 5 - MERGE DATA INTO EDW TABLE';
+
+      V_SQL := 'MERGE INTO ' || T_EDW.OWNER || '.' || T_EDW.TBL_NM ||
+               ' EDW' || CHR(10) || 'USING(SELECT ' || T_EDW.COL_LIST ||
+               ' FROM  ' || T_PRE.OWNER || '.' || T_PRE.TBL_NM || CHR(10) ||
+               ' WHERE ACTIVE_FLAG = ''Y'')PRE' || CHR(10) || 'ON (EDW.' ||
+               T_EDW.PK_COL || ' = PRE.' || T_PRE.PK_COL || ') ' || CHR(10) ||
+               'WHEN MATCHED THEN
+                     UPDATE SET EDW.RECORD_EFF_TO_DT = PRE.RECORD_EFF_TO_DT
+                WHEN NOT MATCHED THEN
+                     INSERT
+                     VALUES(' ||
+               LTRIM(REPLACE(',' || T_EDW.COL_LIST, ',', ',PRE.'), ',') || ') ';
+
+      V_LOG.SQL_STMT := TO_CLOB(V_SQL);
+
+      --DBMS_OUTPUT.PUT_LINE('----' || V_LOG.LOG_TEXT || chr(10) || chr(10) || V_SQL || chr(10) );
+
+      EXECUTE IMMEDIATE (V_SQL);
+      COMMIT;
+
+
+      INSERT INTO ETL_PROCESS_LOG VALUES V_LOG;
+      COMMIT;
+      
+      -- 6 -- INCREMENTAL LOAD 
+           -- 1) UPDATE HASH_NBR/RECORD_EFF_FROM_DT/REOCRD_EFF_TO_DT TO SK TABLE 
+           -- 2) Delete data in sk_table where sk.sk in (select pk from pre_table where active_flag='N'
+
+      V_SQL := 'select SEQ_ETL_PROCESS_RUN_ID.nextval from dual';
+      execute immediate V_SQL into V_LOG.ETL_PROCESS_LOG_ID;
+      V_LOG.ETL_PROCESS_RUN_ID       := 6;
+      V_LOG.ENTITY_PROCESS_ID        := 1;
+      V_LOG.LOG_TMSP                 := SYSDATE;
+      V_LOG.LOG_TEXT                 := 'SP_LOAD_EDW: 2.2 - MERGE HASH_NBR INTO SK TABLE';
+      
+      /*V_SQL := 'SELECT window_load_start_dt  
+        FROM ' || P_STG_LIBRY || '.etl_batch_history  
+       WHERE batch_id = ' || P_BATCH_NUM; 
+       
+      EXECUTE IMMEDIATE V_SQL INTO V_BATCH_START_TS;*/
+      
+      SELECT window_load_start_dt INTO V_BATCH_START_TS 
+        FROM etl_batch_history  
+       WHERE batch_id = P_BATCH_NUM; 
+       
+      EXECUTE IMMEDIATE V_SQL ;
+
+      V_SQL := 'MERGE INTO ' || T_SK.OWNER || '.' || T_SK.TBL_NM || ' SK' ||
+               CHR(10) || 'USING(SELECT ' || T_PRE.PK_COL ||
+               ',RECORD_EFF_DT,RECORD_EFF_TO_DT,HASH_NBR,ACTIVE_FLAG' || ' FROM ' ||
+               T_PRE.OWNER || '.' || T_PRE.TBL_NM || ') PRE ' || CHR(10) ||
+               'ON(PRE.' || T_PRE.PK_COL ||' = SK.SK)
+        WHEN MATCHED THEN
+        UPDATE SET 
+                   SK.HASH_NBR           = PRE.HASH_NBR,
+                   SK.RECORD_EFF_FROM_DT = PRE.RECORD_EFF_DT
+             --WHERE PRE.ACTIVE_FLAG       = ''Y''
+        DELETE 
+             WHERE PRE.ACTIVE_FLAG       = ''N''
+               AND SK.RECORD_EFF_FROM_DT >= TO_TIMESTAMP(''' || V_BATCH_START_TS || ''',''DD-MM-YYYY HH24:MI:SS.FF6'')';
+
+      DBMS_OUTPUT.PUT_LINE('----' || V_LOG.LOG_TEXT || chr(10) || chr(10) || V_SQL || chr(10) );
+
+      V_LOG.SQL_STMT := TO_CLOB(V_SQL);
+
+      EXECUTE IMMEDIATE (V_SQL);
+      COMMIT;
+
+      INSERT INTO ETL_PROCESS_LOG VALUES V_LOG;
+      COMMIT;
+
+    END IF;
+
+  DBMS_OUTPUT.PUT_LINE('----DONE! ' || TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS'));
+  END;
+  
+  EXCEPTION
+    WHEN COL_NUM_INCORRECT OR TAB_NOT_EXISTS OR PK_NOT_DEFINED THEN
+      V_SQL := 'select SEQ_ETL_PROCESS_RUN_ID.nextval from dual';
+      execute immediate V_SQL into V_ERR.ETL_PROCESS_RUN_ID;
+      V_ERR.ENTITY_PROCESS_ID        := V_LOG.ENTITY_PROCESS_ID;
+      V_ERR.ERROR_TMSP               := SYSDATE;
+      V_ERR.SRC_SYS                  := V_LOG.SRC_SYS;
+      V_ERR.ERROR_TEXT               := V_LOG.LOG_TEXT;
+      V_ERR.SQL_STMT                 := V_LOG.SQL_STMT;
+
+      DBMS_OUTPUT.PUT_LINE(V_EXCEPTION_TXT);
+      INSERT INTO ETL_PROCESS_ERROR VALUES V_ERR;
+      COMMIT;
+      RAISE_APPLICATION_ERROR(-20001, V_EXCEPTION_TXT);
+    WHEN OTHERS THEN
+      V_SQL := 'select SEQ_ETL_PROCESS_RUN_ID.nextval from dual';
+      execute immediate V_SQL into V_ERR.ETL_PROCESS_RUN_ID;
+      V_ERR.ENTITY_PROCESS_ID        := V_LOG.ENTITY_PROCESS_ID;
+      V_ERR.ERROR_TMSP               := SYSDATE;
+      V_ERR.SRC_SYS                  := V_LOG.SRC_SYS;
+      V_ERR.ERROR_TEXT               := V_LOG.LOG_TEXT;
+      V_ERR.SQL_STMT                 := V_LOG.SQL_STMT;
+      DBMS_OUTPUT.PUT_LINE(SQLCODE||'---'||SQLERRM);
+      INSERT INTO ETL_PROCESS_ERROR VALUES V_ERR;
+      COMMIT;
+      RAISE_APPLICATION_ERROR(SQLCODE, SQLERRM);
+
+END SP_LOAD_EDW;
