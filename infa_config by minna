@@ -1,0 +1,396 @@
+Enter file contents here
+
+
+
+Informatica运维文档
+
+
+
+
+
+
+
+
+
+
+
+
+
+变更记录
+序号	日期	修订章节/内容	修订原因	修订者
+1.0	2014-06-23		编写	卓燕眉
+1.1	2014-06-25	3.2/用户密码修改
+3.4/同步生产环境的用户及组到灾备环境及组到灾备环境
+8/生产环境切换到灾备
+7/日志管理	编写	卓燕眉
+1.1	2014-06-30	6/Connection权限修改		
+1.2	2014-08-11	Integration Service需要修改的属性值
+	编写	卓燕眉
+1.3	2015-01-14	10/需要要停止Informatica但不 停止Repository Service及Integration Service的运维步骤	编写	卓燕眉
+1.4	2015-5-25	3.3.1，3.4.1/检查服务运行状态	修改	卓燕眉
+
+ 
+
+目    录
+INFORMATICA运维文档	1
+目    录	2
+1	编写目的	4
+2	客户端配置	4
+2.1	配置环境变量PATH	4
+2.2	配置环境变量INFA_DOMAINS_FILE	5
+3	系统管理	5
+3.1	INFORMATICA服务管理	5
+3.1.1	启动服务	5
+3.1.2	禁用服务	6
+3.2	DOMAIN管理	6
+3.2.1	Domain管理	6
+3.2.2	Node节点管理	6
+4	用户管理	7
+4.1	注意事项	7
+4.2	添加开发用户	7
+4.3	修改ADMINISTRATOR用户密码	9
+4.4	同步生产环境的用户及组到灾备环境	9
+5	创建文件夹	10
+6	CONNECTIONT管理	10
+7	日志管理	11
+7.1	服务器日志文件	11
+7.2	控制台日志	11
+7.3	WORKFLOW MANAGER日志	12
+8	生产环境切换到灾备	13
+8.1	检查灾备环境并启动服务	13
+8.1.1	检查节点	13
+8.1.2	检查Repository Servic	14
+8.1.3	检查Integration Service	14
+8.2	恢复WORKFLOW(工作流)调度	15
+8.2.1	重新配置域	15
+8.2.2	Workflow重新分配Integration Service	16
+8.2.3	Session运行监控	17
+9	附件	18
+
+ 
+
+1	编写目的
+本文档旨在本次项目中实施,Informatica工具所涉及到运维管理。范围
+本文档读者包括：
+	项目经理；
+	系统管理员；
+	DBA管理员；
+	运维人员；
+本项目需要使用到的技术：
+	ETL数据整合及转换：Informatica
+	操作系统： Linux
+	数据库： Oracle
+参考文档
+ IN_951_AdministratorGettingStartedGuide.pdf
+ IN_951HF3AdministratorGuidelines_em.pdf  
+2	客户端配置
+2.1	配置环境变量path
+修改用户环境变量path，将$INFA_HOME\clients\DeveloperClient\infacmd添加到path里，如E:\Informatica\9.5.1\clients\DeveloperClient\infacmd
+将PowerCentor的客户的bin目录添加到path里，如E:\Informatica\9.5.1\clients\PowerCenterClient\CommandLineUtilities\PC\server\bin
+  
+图 2 1 修改path变量
+2.2	配置环境变量INFA_DOMAINS_FILE
+将附件domains.infa复制到$INFA_HOME如：E:\Informatica\9.5.1。添加用户环境变量INFA_DOMAINS_FILE=$INFA_HOME\domains.infa如E:\Informatica\9.5.1\domains.infa.
+domain.infa：该文件保存Domain的配置信息，用于执行infacmd命令时能够Domain的名称找到Domain的主机及端口。一个domain.infa文件可保存多个Domain的信息并可根据实际情况进行扩充及修改。下图是以附件domains.infa为例的说明
+ 
+图 2 2 domains.infa文件中Domain的定义
+3	系统管理
+3.1	Informatica服务管理
+3.1.1	启动服务
+>su - infra
+>cd $INFA_HOME/tomcat/bin
+>sh infaservice.sh startup
+>##约等三分钟
+>ps –ef|grep infra                 
+对于主节点（一般是一个Domain里第一个启动的节点）将会有以下两个进程
+ 
+对于非主节点将会有以下一个进程
+ 
+3.1.2	禁用服务
+注意：在生产环境和灾备环境中，由于是HA的Domain，在禁用一个节点的服务前一定要确认另一个节点的服务是已经启动的，这样才不会影响生产环境中Workflow的运行。
+>su - infra
+>cd $INFA_HOME/tomcat/bin
+>sh infaservice.sh shutdown
+>## Stopping Informatica services on node 'cnsz01pl0180_node02'
+3.2	 Domain管理
+3.2.1	Domain管理
+ 
+3.2.2	Node节点管理
+ 
+3.3	Repository Service管理
+3.3.1	检查Repository Service运行是否正常
+pmrep connect -r Rep_infadev -h informatica-dev.sf-express.com -o 6005 -n Administrator -x sf123456 |grep "connect completed successfully."
+ 
+3.3.2	启动Repository Service
+>su - infra
+>cd $INFA_HOME/tomcat/bin
+> sh infacmd.sh enableservice -dn Domain_Name -un Administrator -pd ****  -hp hostname:6005 –sn  repository_Service
+例子：sh infacmd.sh enableservice -dn Domain_cnsz03vl0269 -un Administrator -pd sf123456  -hp cnsz03vl0269:6005 -sn Rep_test
+ 
+
+3.3.3	禁用Repository Service
+##禁用Integration Service,在生产环境中对于-mo选项只能用complete禁用时间可能会很长, complete模式下要等待所有正在运行workflow停止
+>su - infra
+>cd $INFA_HOME/tomcat/bin
+> sh infacmd.sh isp disableservice -dn Domain_Name -un UserName -pd Password -hp hostname:6005  -sn repository _Service  -mo abort|stop|complete
+例子：sh infacmd isp sisableservice -dn Domain_cnsz03vl0261 -un Administrator -pd ****** -hp cnsz03vl0261:6005  -sn REP_test  -mo complete  
+ 
+3.4	Integration Service管理
+3.4.1	检查Integratition Service运行是否正常
+pmcmd pingservice -sv IS_Rep_infadev  -d Domain_cnsz03vl0261|grep ‘Integration Service is alive.’
+ 
+3.4.2	Integration Service需要修改的属性值
+在生产环境和灾备环境中创建Integration Service时，需要设置调整‘弹性超时’及‘弹性超时限制’这两个属性的值。避免Repository Service异常恢复时间过长时Integration Service不能正常启动的情况。
+ 
+
+3.4.3	启动前的检查
+如果是因为异常宕机导致要重启Integration Service，在重启服务之前，要先将宕机前将失败的Workflow先Assign 到空的Integration Service。并记录这些失败的Workflow并在分析并解决导致Workflow失败的原因后再将Workflow Assign 到之前的集成服务。
+查找失败的Workflow可连接到Repository对应的后台数据库执行附件中的query_failed_workflow.sql
+将Workflow Assign 到空的Integration Service。
+ 
+3.4.4	启动Integration Service
+启动Integration Service
+>su - infra
+>cd $INFA_HOME/tomcat/bin
+> sh infacmd.sh enableservice -dn Domain_Name -un Administrator -pd *****  -hp hostname:6005 -sn Integration_Service 
+例子：sh infacmd.sh enableservice -dn Domain_cnsz03vl0269 -un Administrator -pd sf123456  -hp cnsz03vl0269:6005 -sn is_test
+ 
+3.4.5	禁用Integration Service
+##禁用Integration Service,在生产环境中对于-mo选项只能用complete禁用时间可能会很长, complete模式下要等待所有正在运行workflow停止
+>su - infra
+>cd $INFA_HOME/tomcat/bin
+> sh infacmd.sh isp disableservice -dn Domain_Name -un UserName -pd Password -hp hostname:6005  -sn Integration_Service  -mo abort|stop|complete
+例子：sh infacmd.sh isp disableservice -dn Domain_cnsz03vl0261 -un Administrator -pd ****** -hp cnsz03vl0261:6005  -sn is_test  -mo complete  
+ 
+3.5	License管理
+3.5.1	查看License属性
+查看分配到License下的服务
+>su - infra
+>cd $INFA_HOME/tomcat/bin
+>sh infacmd.sh isp assignedtolicense -dn Domain_Name -un UserName -pd Password -hp hostname:6005 –ln license_name
+ 
+3.5.2	添加License
+   命令行添加
+>su - infra
+>cd $INFA_HOME/tomcat/bin
+> sh infacmd.sh isp addlicense -dn Domain_Name -un UserName -pd Password -hp hostname:6005 -ln license_name -lf license_key_file
+手动添加：
+ 
+3.5.3	为Repository Service、Integration Service更换License
+先禁用License下的Integration Service，再禁用 License下的Repository Service（参考3.3，3.4）
+将License分配给Repository Service、Integration Service
+命令行
+>su - infra
+>cd $INFA_HOME/tomcat/bin
+#将服务从原先的License中迁出
+>sh infacmd.sh isp unassignlicense -dn Domain_Name -un UserName -pd Password -hp hostname:6005 –ln license_name -sn service1_name service2_name ...
+#将服务分配到新License
+>sh infacmd.sh isp assignlicense -dn Domain_Name -un UserName -pd Password -hp hostname:6005 –ln license_name -sn service1_name service2_name ...
+手动
+ 
+先启用License下的Repository Service，再启用 License下的Integration Service（参考3.3，3.4）
+对session进行监控，参考session进行监控
+3.5.4	删除License
+先禁用License下的Integration Service，再禁用 License下的Repository Service（参考3.3，3.4）
+命令行
+sh infacmd.sh isp removelicense -dn Domain_Name -un UserName -pd Password -hp hostname:6005 -ln license_name
+手动
+ 
+4	用户管理 
+4.1	添加开发用户
+1.	创建用户
+参数说明：域名（-dn)，域管理用户名(-un),域管理用户密码(-pd) sf123456,新建用户名(-nu)为USERNAME，密码(-pd)是PASSWORD，全名(-nf)是USER_FULL_NAME，描述（-ds）
+Unix环境下：
+>cd $INFA_HOME/server/bin
+>##创建用户
+>sh infacmd.sh  createuser -dn Domain_cnsz03vl0261  -un Administrator -pd ****** -hp cnsz03vl0261:6005 -nu USERNAME -np PASSWORD -nf USER_FULL_NAME -ds "DESC"
+>##更改用户（-ru）密码（-rp）
+>sh infacmd.sh ResetPassword  -dn Domain_cnsz03vl0261 -un Administrator -pd ******  -hp cnsz03vl0261:6005 -ru resetusername -rp resetpassword
+Window(客户端)环境下：
+> infacmd  createuser -dn Domain_cnsz03vl0261  -un Administrator -pd ****** -hp cnsz03vl0261:6005 -nu USERNAME -np PASSWORD -nf USER_FULL_NAME -ds "DESC"
+>##更改用户（-ru）密码（-rp）
+>infacmd ResetPassword  -dn Domain_cnsz03vl0261 -un Administrator -pd ******  -hp cnsz03vl0261:6005 -ru resetusername -rp resetpassword
+
+手动：如下图所示操作，在弹出界面输入信息点击确定
+ 
+2.	将上一步创建的用户(-en) 添加到组（-gn) ‘Execute’组
+参数说明：域名（-dn)，域管理用户名(-un),域管理用户密码(-pd) sf123456，主机名：端口（-hp），用户名（-en），组名（-gn）
+Unix环境下：
+>cd $INFA_HOME/server/bin
+>sh infacmd.sh  AddUsertoGroup -dn Domain_cnsz03vl0269  -un Administrator -pd ****** -hp cnsz03vl0269:6005 -eu USERNAME -gn  Execute
+Window(客户端)环境下：
+>infacmd  AddUsertoGroup -dn Domain_cnsz03vl0261  -un Administrator -pd ****** -hp cnsz03vl0261:6005 -eu USERNAME -gn  Execute
+手动：
+ 
+ 
+4.2	修改Administrator用户密码
+修改Administrator用户密码时还要修改集成服务的对应属性，并且要生重启集成服务，在重启集成服务时要保证生产不受影响
+ 
+ 
+ 
+4.3	同步生产环境的用户及组到灾备环境
+备份生产环境的用户及组
+登陆到生产环境
+>cd $INFA_HOME/server/bin
+>sh infacmd.sh  exportusersandgroups -dn Domain_cnsz02pl0175  -un Administrator -pd ****** -hp cnsz02pl0175:6005 -ef $INFA_HOME/user_groups.xml –f
+同步生产环境的用户及组到灾备环境
+登陆到灾备环境
+  > cd $INFA_HOME
+     > vi user_groups.xml
+     >##将生产环境中 user_groups.xml 文件中的内容复制到灾备环境的user_groups.xml 文件
+     > cd $INFA_HOME/server/bin
+     >sh infacmd.sh  importusersandgroups -dn Domain_cnsz01pl0179  -un Administrator -pd ****** -hp cnsz01pl0180:6005 -ef $INFA_HOME/user_groups.xml –rd 
+    >rm  $INFA_HOME/user_groups.xml
+    >##删除生产环境的 $INFA_HOME/user_groups.xml
+5	创建文件夹
+>pmrep
+> connect -r Rep_infadev -h informatica-uat.sf-express.com -o 6005 -n USERNAME -x PASSWORD
+>createfolder -n FOLDER_NAME -d 'DESC' -o OWNER_NAME
+6	Connection管理 
+创建connection
+>pmrep
+> connect -r Rep_infadev -h informatica-uat.sf-express.com -o 6005 -n USERNAME -x PASSWORD
+>createconnection -s "Oracle"|"ODBC" -n CONNECTION_NAME -u USER_NAME -p PASSWORD -c CONNECT_STRING  -l "MS936"|"utf-8"|...
+更新connection
+>pmrep
+> connect -r Rep_infadev -h informatica-uat.sf-express.com -o 6005 -n USERNAME -x PASSWORD
+>updateconnection -t "Oracle"|"ODBC"  -d CONNECTION_NAME -u USER_NAME -p PASSWORD -c CONNECT_STRING 
+删除connection
+>deleteconnection -n CONNECTION_NAME -f -s "relational"
+修改Connection连接的权限
+  命令行修改
+>pmrep
+# -u(连接到Repository的用记，一般为Administrator)
+> connect -r Rep_infadev -h informatica-uat.sf-express.com -o 6005 -n USERNAME -x PASSWORD
+#-o(对象类型)，-u (被授权用户)，-p （r 读的权限,w 写的权限 ,x 执行的权限）
+>assignpermission -o connection  -n connection_name -u user_name -p rwx
+控制台修改
+登陆到Workflow ManagerConnection(连接)RelationalObjects：选择需要修改的Connection连接Permission…(按钮)修改属主。
+ 
+7	workflow计划管理
+在Workflow上线之后，可能会由于一些原因需要取消workflow的计划运行。如果是短期内（小于1小时）可以完成维护，可以使用Unschedule 操作
+批量获取需要 unscheduled 
+Sqlplus  conn  infra 数据库 （infra.db.sfdc.com.cn）
+select DISTINCT 'unscheduleworkflow  -f ' || A.SUBJECT_AREA ||' ' ||A.WORKFLOW_NAME  from REPDB.REP_SESSION_INSTANCES  A where  connection_name like 'ORA_EBIL%';
+      ># 未设置Path 变量的的情况下
+>cd  E:\Informatica\9.5.1\clients\PowerCenterClient\CommandLineUtilities\PC\server\bin
+    或 cd $INFA_HOME/server/bin
+>pmcmd 
+>connect  -sv is_Rep_prd  -d Domain_cnsz02pl0175 -u Administrator –p *******
+>unscheduleworkflow  -f FOLDER WORKFLOW
+将workflow重新调度起来
+>pmcmd 
+>connect  -sv is_Rep_prd  -d Domain_cnsz02pl0175 -u Administrator -p ******
+>scheduleworkflow  -f FOLDER WORKFLOW
+
+
+批量获取需要 scheduled  的work flow
+Sqlplus  conn  infra 数据库 （infra.db.sfdc.com.cn）
+select DISTINCT 'scheduleworkflow  -f ' || A.SUBJECT_AREA ||' ' ||A.WORKFLOW_NAME  from REPDB.REP_SESSION_INSTANCES  A where  connection_name like 'ORA_EBIL%'; (CONNECTION_NAME  ORA_EBIL 开头 代表要维护的是 oracle ebil数据库所有相关work flow 也可以 以SUBJECT_AREA（FOLDER 名字为范围进行调整)
+
+或者Workflow
+  
+由于Informatica 的Integration Service 重启后会把所有设置有Schedule的Workflow都Schedule起来，所以为避免Integration Service 异常重启后Workflow 被Schedule 运行而导致数据错误，要将Workflow Assign 到空的Integration Service。
+  
+
+
+
+
+8	日志管理
+8.1	服务器日志文件
+$INFA_HOME/tomcat/bin 或者 $INFA_HOME/isp/logs/yyyy-mm-dd/node_name
+catalina.out     Informatica服务启动时的日志文件
+exceptions.log   Informatica服务异常日志
+node.log        Node 日志
+/app/infra_shared/informatica/infa_shared（生产及灾备）或$INFA_HOME/server/infa_shared/(开发及测试)
+BWParam     参数文件存储路径
+Backup       知识库备份路径
+BadFiles      Rejected rows记录文件，
+SessLogs      Session 日志文件，在Workflow Manager最多能查看最近20次的日志，在这个路径下可以查看最近100次的记录
+WorkflowLogs  Workflow日志
+8.2	控制台日志
+Domain日志查看
+ 
+服务日志查看（Repository Service，Integration Service等）
+ 
+8.3	Workflow Manager日志
+ 
+9	 生产环境切换到灾备
+9.1	检查灾备环境并启动服务
+登陆控制台：https://10.0.26.98:8443/administrator 或 https://10.0.26.99:8443/administrator
+如两个IP都无法登陆，则登陆到相应两个服务器启动Informatica的服务，启动服务操作如下：
+>su -  infra
+>cd $INFA_HOME/tomcat/bin
+>sh infaservice.sh startup
+>##约等三分钟
+>ps –ef|grep infra                 
+对于主节点（一般是一个Domain里第一个启动的节点）将会有以下两个进程
+ 
+对于非主节点将会有以下一个进程
+ 
+Informatica服务启动生就可登陆控制台：https://10.0.26.98:8443/administrator 或 https://10.0.26.99:8443/administrator，刚启动完Informatica服务登陆控制台可能会有少许延迟。
+9.1.1	检查节点
+灾备的两个节点可用，若有哪个节点不可用则启动节点的服务
+  
+9.1.2	检查Repository Servic
+检查Repository Service进程在两个节点都是可用的
+ 
+若有哪个节点进程不可用则将服务进程应用到节点
+ 
+检查节点模式为普通（Normal）
+ 
+检查完节点后启动Repository Service
+ 
+9.1.3	检查Integration Service
+检查Integration Service进程在两个节点都是可用的
+ 
+检查Integration Service进程的字符集如果不是UTF8则执行下列命令修改
+  #修改主节点的字符集
+>sh $INFA_HOME/server/bin/infacmd.sh UpdateServiceProcess -dn Domain_cnsz01pl0179 -un Administrator -pd password -sn Is_Rep_prd_DR_HA_XX  -po Codepage_ID=106 -Gateway "hostname1:6005"  -nn nodename
+#修改备份节点的字符集
+>sh $INFA_HOME/server/bin/infacmd.sh UpdateServiceProcess -dn Domain_cnsz01pl0179 -un Administrator -pd infaprd32! -sn Is_Rep_prd_DR_HA -po Codepage_ID=106 -Gateway " hostname2:6005"  -nn cnsz01pl0180_node02
+ 
+若有哪个节点进程不可用则将服务进程应用到节点
+ 
+检查完节点后启动Integration Service
+ 
+9.2	恢复Workflow(工作流)调度
+9.2.1	重新配置域
+由于一个客户端不能有两个重名的Repository Service，所以要重新配置域取消对Domain_cnsz02pl75下Rep_prd的连接并建立Domian_cnsz01pl79下Rep_prd的连接。
+打开 RepositoryManager，在打开的的页面上选择：Power Centor RepositoryManagerConfigure Domain
+取消对Domain_cnsz02pl75下Rep_prd的连接
+ 
+建立Domian_cnsz01pl79下Rep_prd的连接
+ 
+9.2.2	Workflow重新分配Integration Service
+由于Workflow在生产环境分配Integration Service在灾备环境中是不存在的所以要在灾备环境下为Workflow重新分配Integration Service。要求每次只对一个文件夹下的Workflow进行重新分配Integration Service的操作，操作过程如下：
+登陆Workflow Manager连接到相应的Repository并关闭所有文件夹选择任意的Integration Service，右键并选择“Assigned to workflows …”在弹出的对话框中选择文件夹，查看文件夹下已分配的Integration Service的名称选择Workflow当前的分配的Integration Service的名称添加“_DR_HA”后缀分配给Workflow
+ 
+登陆到到Workflow Monitor查看相应文件夹下的Workflow是否已经处于Schedule状态。如果有发现多个Workflow或Session处于Waiting状态时，说明当前Informatica服务有较大的压力，暂停剩余的操作，直到处于Waiting状态的Workflow或Session消失为止再继续剩余的操作。
+重复执行以上操作将剩余文件夹下的Workflow分配到相应的Integration Service
+9.2.3	Session运行监控
+从生产切换到灾备环境需要对所有的Session任务进行特别的关注
+Workflow Monitor
+   
+后台知识库
+数据库：infra_prd= (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = infra.db.sfdc.com.cn)(PORT = 1521)) (CONNECT_DATA = (SERVER = DEDICATED) (SERVICE_NAME = infra) (INSTANCE_NAME = infra)))
+用户及密码：repdb/*****
+查询SQL：参考附件query_session_log.sql
+10	重启Infa服务但不是重启应用服务的运维步骤
+活动节点：Repository Service 及Integration Service正在运行的节点
+非活动节点：Repository Service 及Integration Service待机的节点
+
+查看Repository Service 及Integration Service运行在哪个节点上
+ 
+ 
+选择非活动节点进行运维所需的操作
+重启非活动节点的Informatica服务
+停止活动节点的Informatica服务，并观察Repository Service 及Integration Service是否能成功切换到之前的非活动节点运行。如果切换不成功，则手动重启Repository Service 及Integration Service。
+选择之前的活动节点进行运维所需的操作
+重启之前的活动节点的Informatica服务
+重启Informatica服务参考Informatica服务管理
+重启Repository Service 及Integration Service参考Repository Service管理及Integration Service管理
+11	附件
+   
+
+	
